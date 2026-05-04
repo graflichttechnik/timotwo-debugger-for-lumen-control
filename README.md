@@ -1,6 +1,6 @@
 # TimoTwo SPI Register Debugger
 
-Browser-based SPI register debugger for the [Radical Wireless](https://radicalwireless.com) **LUMEN CONTROL** module. Runs on an ESP32, serves a self-hosted web UI over WiFi — no dedicated hardware debugger needed.
+Browser-based SPI register debugger for the [Radical Wireless](https://www.radicalwireless.com/products/lumen-control) **LUMEN CONTROL** module. Runs on an ESP32, serves a self-hosted web UI over WiFi — no dedicated hardware debugger needed.
 
 ---
 
