@@ -1,36 +1,38 @@
 /**
  * timotwo_driver.h
  * ─────────────────────────────────────────────────────────────
- *  Made for Radical Wireless Lumenradio TimoTwo — bare-metal SPI driver
- *  by Stefan Graf stefan-graf-lichttechnik.de - April 2026
- *  github page: https://github.com/graflichttechnik
+ *  LumenRadio TimoTwo: bare-metal SPI driver
+ *  Target: ESP32-WROOM-32 (VSPI) | Arduino framework
+ *  Version: 1.0.0 - October 2026
+ *  Tested with: TimoTwo FX firmware 1.1.1.5
  *
- *  Target: ESP32 dev boards, like ESP32 Wroom 32 or ESP32 S3 (via VSPI) | Arduino framework
+ *  No WiFi. No web server. No HTML. Just SPI.
+ *  All functions are inline: the header can be included from more
+ *  than one source file.
  *
  *  Wiring (LUMEN CONTROL 10-pin header):
- *    Pin  1  VDD  → 5V (buck conversion to 3.3V)
+ *    Pin  1  VDD  → 3.3 to 10 VDC
  *    Pin  2  CS   → GPIO  5
- *    Pin  3  DMX+ → GPIO not assigned (optional)
  *    Pin  4  SCK  → GPIO 18
- *    Pin  5  DMX- → GPIO not assigned (optional)
  *    Pin  6  MOSI → GPIO 23
  *    Pin  7  IRQ  → GPIO  4  (input, pull-up)
  *    Pin  8  MISO → GPIO 19
  *    Pin  9  LINK → GPIO  2  (optional)
  *    Pin 10  VSS  → GND
  * ─────────────────────────────────────────────────────────────
- *  SPI Specifications:
+ *  SPI protocol summary (LumenRadio TimoTwo Development Documentation):
  *
- *  Every transaction is two-phase:
+ *  Every command is two-phase:
  *
- *    Phase 1 — Command byte:
+ *    Phase 1: command byte
  *      CS low → [4µs setup] → transfer(cmd) → CS high
- *      If returned byte has Bit7 set: SPI_DEVICE_BUSY, retry.
- *      Otherwise: wait for IRQ to go LOW (command acknowledged).
+ *      The byte returned is IRQ_FLAGS. If bit 7 (SPI_DEVICE_BUSY) is set,
+ *      the whole sequence is restarted. Otherwise wait for IRQ to go LOW
+ *      (command acknowledged).
  *
- *    Phase 2 — Payload:
+ *    Phase 2: payload
  *      CS low → [4µs setup] → transfer(0xFF, ignored) → data → CS high
- *      Wait for IRQ to go HIGH (transfer complete).
+ *      Wait for IRQ to go HIGH (processing complete).
  *
  *  Command byte encoding:
  *    READ_REG  addr:  0b00AA_AAAA  (0x00 | addr)
@@ -53,8 +55,12 @@
 #define TIMO_PIN_LINK   2
 
 // ── SPI settings ──────────────────────────────────────────────
-#define TIMO_SPI_FREQ   1000000UL   // 1 MHz — max allowed is 2 MHz
+#define TIMO_SPI_FREQ        1000000UL   // 1 MHz (Dev Doc maximum: 8 MHz)
 #define TIMO_IRQ_TIMEOUT_MS  200
+#define TIMO_BUSY_BUDGET_MS  30          // a command sequence is restarted for this long while the module reports busy
+#define TIMO_RESTART_WAIT_MS 300         // wait after a write that restarts the module
+#define TIMO_RESTART_POLL_MS 3000        // then poll PRODUCT_ID for up to this long
+#define TIMO_LABEL_SETTLE_MS 2000        // wait after DEVICE_NAME / OEM_INFO writes
 
 // ── SPI commands ──────────────────────────────────────────────
 #define TIMO_CMD_READ(addr)   ((uint8_t)((addr) & 0x3F))
@@ -116,6 +122,7 @@
 #define TIMO_RF_WDMX_G4S   0x03
 
 // ── RF power values (TX only) ─────────────────────────────────
+// Dev Doc: output power from a 2 dBi antenna (EIRP). Reset value is 2.
 #define TIMO_PWR_20DBM     0x02   // 100 mW
 #define TIMO_PWR_16DBM     0x03
 #define TIMO_PWR_11DBM     0x04
@@ -125,15 +132,18 @@
 #define TIMO_PRODUCT_ID_0  0xF1
 #define TIMO_PRODUCT_ID_1  0x40
 
-// ── Internal SPI bus instance ─────────────────────────────────
-static SPIClass _timoSPI(VSPI);
+// ── Internal SPI bus instance (one instance across all source files) ──
+inline SPIClass& _timoSPI() {
+    static SPIClass bus(VSPI);
+    return bus;
+}
 
 // ─────────────────────────────────────────────────────────────
 //  Low-level helpers
 // ─────────────────────────────────────────────────────────────
 
 // Wait for IRQ pin to reach targetState within timeout
-static bool _timoWaitIRQ(bool targetState, uint32_t timeoutMs = TIMO_IRQ_TIMEOUT_MS) {
+inline bool _timoWaitIRQ(bool targetState, uint32_t timeoutMs = TIMO_IRQ_TIMEOUT_MS) {
     uint32_t t = millis();
     while ((bool)digitalRead(TIMO_PIN_IRQ) != targetState) {
         if (millis() - t > timeoutMs) return false;
@@ -142,15 +152,36 @@ static bool _timoWaitIRQ(bool targetState, uint32_t timeoutMs = TIMO_IRQ_TIMEOUT
     return true;
 }
 
-// Send a single command byte; returns the IRQ_FLAGS byte received
-static uint8_t _timoSendCmd(uint8_t cmd) {
-    _timoSPI.beginTransaction(SPISettings(TIMO_SPI_FREQ, MSBFIRST, SPI_MODE0));
+// One complete command sequence (command byte, IRQ low, payload, IRQ high).
+// A set SPI_DEVICE_BUSY flag restarts the sequence, with a short pause, for up to TIMO_BUSY_BUDGET_MS.
+// Write: wbuf is sent. Read: rbuf receives len bytes.
+inline bool _timoCommand(uint8_t cmd, const uint8_t* wbuf, uint8_t* rbuf, uint16_t len) {
+    SPIClass& spi = _timoSPI();
+    const uint32_t t0 = millis();
+    for (;;) {
+        spi.beginTransaction(SPISettings(TIMO_SPI_FREQ, MSBFIRST, SPI_MODE0));
+        digitalWrite(TIMO_PIN_CS, LOW);
+        delayMicroseconds(4);
+        uint8_t flags = spi.transfer(cmd);
+        digitalWrite(TIMO_PIN_CS, HIGH);
+        spi.endTransaction();
+        if (!(flags & TIMO_IRQ_SPI_BUSY)) break;
+        if (millis() - t0 > TIMO_BUSY_BUDGET_MS) return false;     // stayed busy
+        _timoWaitIRQ(true, 5);
+        delayMicroseconds(500);
+    }
+    if (!_timoWaitIRQ(false)) return false;          // command not acknowledged
+
+    spi.beginTransaction(SPISettings(TIMO_SPI_FREQ, MSBFIRST, SPI_MODE0));
     digitalWrite(TIMO_PIN_CS, LOW);
     delayMicroseconds(4);
-    uint8_t flags = _timoSPI.transfer(cmd);
+    spi.transfer(0xFF);                              // first byte is ignored by the module
+    if (wbuf) for (uint16_t i = 0; i < len; i++) spi.transfer(wbuf[i]);
+    else      for (uint16_t i = 0; i < len; i++) rbuf[i] = spi.transfer(0x00);
     digitalWrite(TIMO_PIN_CS, HIGH);
-    _timoSPI.endTransaction();
-    return flags;
+    spi.endTransaction();
+
+    return _timoWaitIRQ(true);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -158,124 +189,63 @@ static uint8_t _timoSendCmd(uint8_t cmd) {
 // ─────────────────────────────────────────────────────────────
 
 // Initialize GPIOs and SPI bus. Call once in setup().
-void timoBegin() {
+inline void timoBegin() {
     pinMode(TIMO_PIN_CS,   OUTPUT); digitalWrite(TIMO_PIN_CS, HIGH);
     pinMode(TIMO_PIN_IRQ,  INPUT_PULLUP);
     pinMode(TIMO_PIN_LINK, INPUT_PULLUP);
-    _timoSPI.begin(TIMO_PIN_SCK, TIMO_PIN_MISO, TIMO_PIN_MOSI, TIMO_PIN_CS);
+    _timoSPI().begin(TIMO_PIN_SCK, TIMO_PIN_MISO, TIMO_PIN_MOSI, TIMO_PIN_CS);
 }
 
 // Read `len` bytes from `addr` into `buf`. Returns true on success.
-bool timoRead(uint8_t addr, uint8_t* buf, uint8_t len) {
+inline bool timoRead(uint8_t addr, uint8_t* buf, uint8_t len) {
     if (!buf || len == 0 || len > 64) return false;
-
-    uint8_t flags = _timoSendCmd(TIMO_CMD_READ(addr));
-
-    if (flags & TIMO_IRQ_SPI_BUSY) {
-        _timoWaitIRQ(true);
-        return timoRead(addr, buf, len);   // retry
-    }
-    if (!_timoWaitIRQ(false)) return false;
-
-    _timoSPI.beginTransaction(SPISettings(TIMO_SPI_FREQ, MSBFIRST, SPI_MODE0));
-    digitalWrite(TIMO_PIN_CS, LOW);
-    delayMicroseconds(4);
-    _timoSPI.transfer(0xFF);               // dummy byte, discarded by TimoTwo
-    for (uint8_t i = 0; i < len; i++) buf[i] = _timoSPI.transfer(0x00);
-    digitalWrite(TIMO_PIN_CS, HIGH);
-    _timoSPI.endTransaction();
-
-    return _timoWaitIRQ(true);
+    return _timoCommand(TIMO_CMD_READ(addr), nullptr, buf, len);
 }
 
 // Convenience: read single byte
-uint8_t timoRead8(uint8_t addr) {
+inline uint8_t timoRead8(uint8_t addr) {
     uint8_t v = 0;
     timoRead(addr, &v, 1);
     return v;
 }
 
 // Convenience: read 16-bit big-endian
-uint16_t timoRead16(uint8_t addr) {
+inline uint16_t timoRead16(uint8_t addr) {
     uint8_t b[2] = {};
     timoRead(addr, b, 2);
     return ((uint16_t)b[0] << 8) | b[1];
 }
 
 // Write `len` bytes from `buf` to `addr`. Returns true on success.
-bool timoWrite(uint8_t addr, const uint8_t* buf, uint8_t len) {
+inline bool timoWrite(uint8_t addr, const uint8_t* buf, uint8_t len) {
     if (!buf || len == 0 || len > 64) return false;
-
-    uint8_t flags = _timoSendCmd(TIMO_CMD_WRITE(addr));
-
-    if (flags & TIMO_IRQ_SPI_BUSY) {
-        _timoWaitIRQ(true);
-        return timoWrite(addr, buf, len);  // retry
-    }
-    if (!_timoWaitIRQ(false)) return false;
-
-    _timoSPI.beginTransaction(SPISettings(TIMO_SPI_FREQ, MSBFIRST, SPI_MODE0));
-    digitalWrite(TIMO_PIN_CS, LOW);
-    delayMicroseconds(4);
-    _timoSPI.transfer(0xFF);               // dummy byte
-    for (uint8_t i = 0; i < len; i++) _timoSPI.transfer(buf[i]);
-    digitalWrite(TIMO_PIN_CS, HIGH);
-    _timoSPI.endTransaction();
-
-    return _timoWaitIRQ(true);
+    return _timoCommand(TIMO_CMD_WRITE(addr), buf, nullptr, len);
 }
 
 // Convenience: write single byte
-bool timoWrite8(uint8_t addr, uint8_t value) {
+inline bool timoWrite8(uint8_t addr, uint8_t value) {
     return timoWrite(addr, &value, 1);
 }
 
-// Write DMX payload (up to 512 channels) to TX buffer
-bool timoWriteDMX(const uint8_t* channels, uint16_t count) {
-    if (!channels || count == 0) return false;
-    if (count > 512) count = 512;
-
-    uint8_t flags = _timoSendCmd(TIMO_CMD_WRITE_DMX);
-
-    if (flags & TIMO_IRQ_SPI_BUSY) {
-        _timoWaitIRQ(true);
-        return timoWriteDMX(channels, count);
-    }
-    if (!_timoWaitIRQ(false)) return false;
-
-    _timoSPI.beginTransaction(SPISettings(TIMO_SPI_FREQ, MSBFIRST, SPI_MODE0));
-    digitalWrite(TIMO_PIN_CS, LOW);
-    delayMicroseconds(4);
-    _timoSPI.transfer(0xFF);
-    for (uint16_t i = 0; i < count; i++) _timoSPI.transfer(channels[i]);
-    digitalWrite(TIMO_PIN_CS, HIGH);
-    _timoSPI.endTransaction();
-
-    return _timoWaitIRQ(true);
+// Write DMX payload (1 to 512 channels) to the internal TX buffer.
+// One WRITE_DMX block (blocks of up to 512 bytes: firmware 1.1.1.0 and later).
+inline bool timoWriteDMX(const uint8_t* channels, uint16_t count) {
+    if (!channels || count == 0 || count > 512) return false;
+    return _timoCommand(TIMO_CMD_WRITE_DMX, channels, nullptr, count);
 }
 
-// Read DMX payload from RX buffer (up to 512 channels)
-bool timoReadDMX(uint8_t* channels, uint16_t count) {
-    if (!channels || count == 0) return false;
-    if (count > 512) count = 512;
-
-    uint8_t flags = _timoSendCmd(TIMO_CMD_READ_DMX);
-
-    if (flags & TIMO_IRQ_SPI_BUSY) {
-        _timoWaitIRQ(true);
-        return timoReadDMX(channels, count);
-    }
-    if (!_timoWaitIRQ(false)) return false;
-
-    _timoSPI.beginTransaction(SPISettings(TIMO_SPI_FREQ, MSBFIRST, SPI_MODE0));
-    digitalWrite(TIMO_PIN_CS, LOW);
-    delayMicroseconds(4);
-    _timoSPI.transfer(0xFF);
-    for (uint16_t i = 0; i < count; i++) channels[i] = _timoSPI.transfer(0x00);
-    digitalWrite(TIMO_PIN_CS, HIGH);
-    _timoSPI.endTransaction();
-
-    return _timoWaitIRQ(true);
+// Read `count` channels starting at zero-indexed channel `start`.
+// Sets DMX_WINDOW, then reads the window with one READ_DMX block.
+// No other SPI command may sit between the two.
+inline bool timoReadDMX(uint8_t* channels, uint16_t count, uint16_t start = 0) {
+    if (!channels || count == 0 || start >= 512 || start + count > 512) return false;
+    // DMX_WINDOW: bytes 0-1 window size, bytes 2-3 start address (big-endian)
+    uint8_t win[4] = {
+        (uint8_t)(count >> 8), (uint8_t)(count & 0xFF),
+        (uint8_t)(start >> 8), (uint8_t)(start & 0xFF)
+    };
+    if (!timoWrite(TIMO_REG_DMX_WINDOW, win, 4)) return false;
+    return _timoCommand(TIMO_CMD_READ_DMX, nullptr, channels, count);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -283,14 +253,26 @@ bool timoReadDMX(uint8_t* channels, uint16_t count) {
 // ─────────────────────────────────────────────────────────────
 
 // Returns true if the PRODUCT_ID register matches a known TimoTwo
-bool timoDetect() {
+inline bool timoDetect() {
     uint8_t id[4] = {};
     if (!timoRead(TIMO_REG_PRODUCT_ID, id, 4)) return false;
     return (id[0] == TIMO_PRODUCT_ID_0 && id[1] == TIMO_PRODUCT_ID_1);
 }
 
+// After a write that restarts the module: wait, then poll PRODUCT_ID until it answers.
+// Returns false if the module does not answer within TIMO_RESTART_POLL_MS.
+inline bool timoWaitReady() {
+    delay(TIMO_RESTART_WAIT_MS);
+    uint32_t t0 = millis();
+    while (millis() - t0 < TIMO_RESTART_POLL_MS) {
+        if (timoDetect()) return true;
+        delay(50);
+    }
+    return false;
+}
+
 // Print hardware and firmware version to Serial
-void timoPrintVersion() {
+inline void timoPrintVersion() {
     uint8_t v[8] = {};
     if (!timoRead(TIMO_REG_VERSION, v, 8)) {
         Serial.println("[TimoTwo] version read failed");
@@ -300,17 +282,35 @@ void timoPrintVersion() {
         v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
 }
 
+// Write a CONFIG value, wait for the module to answer again, and decide the result by
+// reading CONFIG back (the write acknowledge can be lost when the module restarts).
+// Only bit 1 (TX/RX mode) is compared: a mode change resets the other bits to reset values.
+inline bool _timoWriteConfig(uint8_t cfg) {
+    uint8_t before = timoRead8(TIMO_REG_CONFIG);
+    bool acked = timoWrite8(TIMO_REG_CONFIG, cfg);
+    bool modeChanged = ((before ^ cfg) & TIMO_CONFIG_TX_MODE) != 0;
+    if (!acked || modeChanged) {
+        if (!timoWaitReady()) return false;
+    }
+    uint8_t after = timoRead8(TIMO_REG_CONFIG);
+    return ((after ^ cfg) & TIMO_CONFIG_TX_MODE) == 0 && (acked || modeChanged);
+}
+
 // Configure TX mode (call before timoEnableRadio)
 // protocol: TIMO_RF_CRMX / TIMO_RF_WDMX_G3 / TIMO_RF_WDMX_G4S
-// channels: 1–512
+// channels: 1 to 512
 // refreshUs: refresh period in µs (25000 = 40 Hz)
-bool timoConfigTX(uint8_t protocol, uint16_t channels, uint32_t refreshUs = 25000) {
-    // CONFIG: enable radio, TX mode, SPI DMX, UART off
-    uint8_t cfg = TIMO_CONFIG_RADIO_EN | TIMO_CONFIG_TX_MODE;
-    if (!timoWrite8(TIMO_REG_CONFIG, cfg)) return false;
-    delay(200);  // module may restart on mode change
+// A mode change restarts the module and resets all registers, so the rest is written afterwards.
+inline bool timoConfigTX(uint8_t protocol, uint16_t channels, uint32_t refreshUs = 25000) {
+    // CONFIG: enable radio, TX mode, UART off
+    if (!_timoWriteConfig(TIMO_CONFIG_RADIO_EN | TIMO_CONFIG_TX_MODE)) return false;
 
-    if (!timoWrite8(TIMO_REG_RF_PROTOCOL, protocol)) return false;
+    // RF_PROTOCOL write can restart the module and swallow the acknowledge,
+    // so the result is decided by the readback
+    timoWrite8(TIMO_REG_RF_PROTOCOL, protocol);
+    if (!timoWaitReady()) return false;
+    if (timoRead8(TIMO_REG_RF_PROTOCOL) != protocol) return false;
+
     if (!timoWrite8(TIMO_REG_RF_POWER, TIMO_PWR_20DBM)) return false;
 
     // DMX_SPEC: channel count + refresh period
@@ -321,74 +321,104 @@ bool timoConfigTX(uint8_t protocol, uint16_t channels, uint32_t refreshUs = 2500
         (uint8_t)(refreshUs >> 8),  (uint8_t)(refreshUs)        // refresh period
     };
     if (!timoWrite(TIMO_REG_DMX_SPEC, spec, 8)) return false;
+
+    // all 512 slots are written once (zeros) before the output is enabled
+    static const uint8_t zeros[512] = {};
+    if (!timoWriteDMX(zeros, 512)) return false;
+
     if (!timoWrite8(TIMO_REG_DMX_CONTROL, 0x01)) return false;  // enable DMX gen
 
     return true;
 }
 
 // Configure RX mode
-bool timoConfigRX() {
-    uint8_t cfg = TIMO_CONFIG_RADIO_EN;  // TX_MODE bit = 0 → RX
-    if (!timoWrite8(TIMO_REG_CONFIG, cfg)) return false;
-    delay(200);
-    return true;
+inline bool timoConfigRX() {
+    return _timoWriteConfig(TIMO_CONFIG_RADIO_EN);   // TX_MODE bit = 0 → RX
 }
 
-// Enable radio
-bool timoEnableRadio(bool enable = true) {
+// Enable or disable the radio (CONFIG bit 7)
+inline bool timoEnableRadio(bool enable = true) {
     uint8_t cfg = timoRead8(TIMO_REG_CONFIG);
     if (enable) cfg |=  TIMO_CONFIG_RADIO_EN;
     else        cfg &= ~TIMO_CONFIG_RADIO_EN;
-    return timoWrite8(TIMO_REG_CONFIG, cfg);
+    return _timoWriteConfig(cfg);
 }
 
-// Set device name (shown in BLE, RDM DEVICE_LABEL, TX universe name)
-// name: null-terminated, max 16 usable chars (32-byte field, null-padded)
-bool timoSetDeviceName(const char* name) {
+// Set device name (Toolbox app, RDM DEVICE_LABEL, TX universe name)
+// name: null-terminated ASCII, up to 31 characters (32-byte field, null-padded).
+// In TX mode the first 16 characters are sent as universe name.
+// Write the name after the last mode change, because a mode change resets registers.
+// Pauses TIMO_LABEL_SETTLE_MS afterwards (observed: a readback directly after the
+// write was empty; the cause is not documented).
+inline bool timoSetDeviceName(const char* name) {
     uint8_t buf[32] = {};
     strncpy((char*)buf, name, 31);
-    return timoWrite(TIMO_REG_DEVICE_NAME, buf, 32);
+    bool ok = timoWrite(TIMO_REG_DEVICE_NAME, buf, 32);
+    if (ok) delay(TIMO_LABEL_SETTLE_MS);
+    return ok;
 }
 
-// Set OEM info: modelId (2 bytes), manufacturerId ESTA (2 bytes)
-// Example: timoSetOEMInfo(0x0001, 0x08B6)  — model 1, Radical Wireless
-bool timoSetOEMInfo(uint16_t modelId, uint16_t estaId) {
+// Set OEM info: ESTA manufacturer ID (bytes 0-1), device model ID (bytes 2-3), big-endian.
+// Example: timoSetOEMInfo(0x08B6, 0x0001)  (manufacturer 08B6, model 1)
+// Pauses TIMO_LABEL_SETTLE_MS afterwards, like timoSetDeviceName().
+inline bool timoSetOEMInfo(uint16_t estaId, uint16_t modelId) {
     uint8_t buf[4] = {
-        (uint8_t)(modelId >> 8), (uint8_t)(modelId & 0xFF),
-        (uint8_t)(estaId  >> 8), (uint8_t)(estaId  & 0xFF)
+        (uint8_t)(estaId  >> 8), (uint8_t)(estaId  & 0xFF),
+        (uint8_t)(modelId >> 8), (uint8_t)(modelId & 0xFF)
     };
-    return timoWrite(TIMO_REG_OEM_INFO, buf, 4);
+    bool ok = timoWrite(TIMO_REG_OEM_INFO, buf, 4);
+    if (ok) delay(TIMO_LABEL_SETTLE_MS);
+    return ok;
 }
 
-// Set universe color (RGB, 3 bytes)
-bool timoSetUniverseColor(uint8_t r, uint8_t g, uint8_t b) {
+// Set universe color (RGB, 3 bytes, TX mode)
+inline bool timoSetUniverseColor(uint8_t r, uint8_t g, uint8_t b) {
     uint8_t buf[3] = {r, g, b};
     return timoWrite(TIMO_REG_UNIVERSE_COLOR, buf, 3);
 }
 
-// Returns true if module is linked to a transmitter (RX) or has active link (TX)
-bool timoIsLinked() {
+// Returns true if the STATUS LINKED bit is set (linked, or pairing in progress)
+inline bool timoHasLinkedFlag() {
     return (timoRead8(TIMO_REG_STATUS) & TIMO_STATUS_LINKED) != 0;
 }
 
-// Returns true if RF link is active
-bool timoHasRFLink() {
+// Returns true if the RF_LINK bit is set (active radio link)
+inline bool timoHasRFLink() {
     return (timoRead8(TIMO_REG_STATUS) & TIMO_STATUS_RF_LINK) != 0;
 }
 
-// Returns link quality 0–255 (RX only)
-uint8_t timoLinkQuality() {
+// Returns true for a valid link: LINKED and RF_LINK are both set
+inline bool timoIsLinked() {
+    uint8_t s = timoRead8(TIMO_REG_STATUS);
+    return (s & TIMO_STATUS_LINKED) && (s & TIMO_STATUS_RF_LINK);
+}
+
+// Unlink: write 1 to STATUS bit 0 (not via the LINK pin), then wait until
+// LINKED and RF_LINK are both clear. Returns false on timeout.
+inline bool timoUnlink(uint32_t timeoutMs = 3000) {
+    if (!timoWrite8(TIMO_REG_STATUS, TIMO_STATUS_LINKED)) return false;
+    uint32_t t0 = millis();
+    while (millis() - t0 < timeoutMs) {
+        uint8_t s = timoRead8(TIMO_REG_STATUS);
+        if (!(s & (TIMO_STATUS_LINKED | TIMO_STATUS_RF_LINK))) return true;
+        delay(50);
+    }
+    return false;
+}
+
+// Returns link quality 0 to 255 (RX only)
+inline uint8_t timoLinkQuality() {
     return timoRead8(TIMO_REG_LINK_QUALITY);
 }
 
 // Returns IRQ_FLAGS byte (check Bit7 for SPI_BUSY, others for events)
-uint8_t timoIRQFlags() {
+inline uint8_t timoIRQFlags() {
     return timoRead8(TIMO_REG_IRQ_FLAGS);
 }
 
 // Check if a specific installed option is present
 // knownOptions: 0x2001 = RDM TX via SPI, 0x2002 = RDM TX via proxy
-bool timoHasOption(uint16_t optionCode) {
+inline bool timoHasOption(uint16_t optionCode) {
     uint8_t buf[13] = {};
     if (!timoRead(TIMO_REG_INSTALLED_OPT, buf, 13)) return false;
     uint8_t count = buf[0];

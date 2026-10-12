@@ -1,112 +1,56 @@
-# TimoTwo SPI Register Debugger
+# TimoTwo ESP32 Web SPI Debugger
 
-Browser-based SPI register debugger for the [Radical Wireless](https://www.radicalwireless.com/products/lumen-control) **LUMEN CONTROL** module. Runs on an ESP32, serves a self-hosted web UI over WiFi — no dedicated hardware debugger needed.
+Browser-based SPI register debugger for the Radical Wireless [**LUMEN CONTROL**](https://www.radicalwireless.com/products/lumen-control) module. It runs on an ESP32, joins your WiFi and serves a web UI. No dedicated hardware debugger needed.
+
+Tested with LumenRadio TimoTwo FX firmware **1.1.1.5**.
 
 ---
 
 ## What it does
 
-- Reads and writes all 29 TimoTwo SPI registers directly from a browser
-- Live decoded output — hex bytes translated to human-readable values (protocols, frequencies, link state, RGB swatches, ASCII strings, etc.)
-- R / W buttons per register, plus single-click **Read all**
-- Full HTML/CSS/JS stored in ESP32 flash (PROGMEM) — no cloud, no dependencies
-- Serial diagnostic logging at 115200 baud
+- Read and write all 29 TimoTwo registers from a browser, with the values decoded into readable text
+- **Read all** in one click
+- DMX test panel: send DMX (blackout, full, channel ranges, fade) and watch received DMX
+- Asks for confirmation before a write that restarts the module
+- Everything is stored on the ESP32, no cloud and no extra libraries
 
 ---
 
-## Hardware
+## Wiring: LUMEN CONTROL 10-pin header to ESP32-WROOM-32
 
-**LUMEN CONTROL** is a compact wireless DMX/RDM module based on the LumenRadio **TimoTwo FX** — a switchable TX/RX transceiver supporting CRMX, W-DMX G3 and G4S, with BLE.
-
-> RDM in RX mode is standard on all TimoTwo variants. RDM in TX mode requires a separately purchased dongle.
-
-### Wiring — LUMEN CONTROL 10-pin header → ESP32
-
-| Pin | Signal | GPIO | Note |
+| Pin | Signal | ESP32 GPIO | Note |
 |:---:|:---:|:---:|:---|
-| 1 | VDD | 3.3V | via 5VDC buck conversion|
+| 1 | VDD | | 3.3 to 10 VDC |
 | 2 | CS | 5 | |
-| 3 | DMX+ | — | nc |
+| 3 | DMX+ | | XLR pin 3 with 120 Ω terminator, for the physical DMX output |
 | 4 | SCK | 18 | |
-| 5 | DMX− | — | nc |
+| 5 | DMX- | | XLR pin 2 with 120 Ω terminator, for the physical DMX output |
 | 6 | MOSI | 23 | |
-| 7 | IRQ | 4 | input, pull-up |
+| 7 | IRQ | 4 | input, pull-up, required |
 | 8 | MISO | 19 | |
 | 9 | LINK | 2 | optional |
 | 10 | VSS | GND | |
-
-> **ESP32-S3:** change `SPIClass timoSPI(VSPI)` → `(FSPI)`
 
 ---
 
 ## Requirements
 
-- Arduino IDE 2.x
-- ESP32 Arduino core ≥ 3.x (Espressif, via Boards Manager)
-- No extra libraries — uses `SPI`, `WiFi`, `WebServer` from the core
+- Arduino IDE 2.x with the ESP32 core from Espressif (Boards Manager), no extra libraries
+- A 2.4 GHz WiFi network (the ESP32 cannot join 5 GHz)
 
 ---
 
-## Installation & Usage
+## Installation and usage
 
-1. Open `timotwo_debugger.ino` in Arduino IDE
-2. Select **ESP32 Dev Module**, choose the correct Port
-3. Upload — hold **BOOT** if it stalls at `Connecting....`
-4. Open Serial Monitor at **115200 baud** — confirm startup:
-   ```
-   [SPI] ready
-   [WiFi] AP: TimoTwo-Debug  IP: 192.168.4.1
-   [HTTP] Server running at http://192.168.4.1
-   ```
-5. Connect to WiFi **`TimoTwo-Debug`** (no password), open `http://192.168.4.1`
+1. Open the folder `timotwo-esp32-web-spi-debugger` in the Arduino IDE (open the `.ino` file inside it).
+2. In that folder, copy `secrets.example.h` to `secrets.h` and enter your WiFi name and password.
+3. Select **ESP32 Dev Module** and your port, then upload. Hold **BOOT** if it stalls at `Connecting....`
+4. Open the Serial Monitor at 115200 baud. It shows the IP address and `http://timotwo-debug.local`.
+5. Open `http://timotwo-debug.local` (or the IP address) in a browser on the same network.
 
----
+> **Network:** The debugger has no password and can write any register. Use it only in a network you trust.
 
-## REST API
-
-| Method | Endpoint | Description |
-|:---|:---|:---|
-| GET | `/api/read?addr=0x00&len=1` | Read register |
-| GET | `/api/write?addr=0x00&data=82` | Write register (hex bytes) |
-| GET | `/api/readall` | Dump all readable registers |
-
-```sh
-# Enable radio, TX mode (CONFIG = 0x82)
-curl "http://192.168.4.1/api/write?addr=0x00&data=82"
-```
-
-Full SPI protocol details → [PROTOCOL.md](PROTOCOL.md)
-
----
-
-## Also Included
-
-[`timotwo_driver.h`](timotwo_driver.h) — bare-metal SPI driver, no web server, no WiFi:
-
-```cpp
-#include "timotwo_driver.h"
-
-void setup() {
-    timoBegin();
-    timoSetOEMInfo(0x0001, 0x08B6);   // model ID, ESTA manufacturer ID, i.e. 08B6
-    timoSetDeviceName("Lumen Control");
-    timoConfigTX(TIMO_RF_CRMX, 512);
-}
-void loop() {
-    timoWriteDMX(dmx, 512);
-}
-```
-
----
-
-## Files
-
-| File | Description |
-|:---|:---|
-| `timotwo_debugger.ino` | Full web debugger (WiFi AP + browser UI) |
-| `timotwo_driver.h` | Bare-metal SPI driver header |
-| `timotwo_example.ino` | Minimal TX example using the driver |
-| `PROTOCOL.md` | SPI protocol & command reference |
+More: [HTTP API](API.md) · [SPI notes](PROTOCOL.md) · [driver and example](timotwo_example/README.md) · [release notes](CHANGELOG.md)
 
 ---
 
@@ -114,18 +58,24 @@ void loop() {
 
 **Stefan Graf** · [stefan@graf-lichttechnik.de](mailto:stefan@graf-lichttechnik.de) · [graf-lichttechnik.de](https://graf-lichttechnik.de)
 
-Developer of the Radical Wireless LUMEN CONTROL and LUMEN CARD modules.
+Developer of the Radical Wireless LUMEN CONTROL module.
+
+---
+
+## Disclaimer
+
+Mistakes can happen. I have tried to test all functions, but I cannot rule out errors. Use the debugger at your own risk: I take no responsibility if something goes wrong. Writing registers changes the module, and some writes restart it or reset settings.
 
 ---
 
 ## License
 
-MIT — see [LICENSE](LICENSE)
+MIT, see [LICENSE](LICENSE)
 
 ---
 
 ## Related
 
-- [LumenRadio TimoTwo Docs](https://docs.lumenrad.io/timotwo/) — official SPI register reference
-- [Radical Wireless](https://radicalwireless.com) — LUMEN CONTROL / LUMEN CARD
-- [tinkerberg.com](https://www.tinkerberg.com/wireless-dmx) — official distributor
+- [LumenRadio TimoTwo Docs](https://docs.lumenrad.io/timotwo/), official SPI register reference
+- [Radical Wireless](https://radicalwireless.com), LUMEN CONTROL
+- [tinkerberg.com](https://www.tinkerberg.com/wireless-dmx), official distributor
